@@ -44,6 +44,6 @@ struct ovpn_socket {
 
 struct ovpn_socket *ovpn_socket_new(struct socket *sock,
 				    struct ovpn_peer *peer);
-void ovpn_socket_release(struct ovpn_socket *sock);
+void ovpn_socket_release(struct ovpn_peer *peer);
 
 #endif /* _NET_OVPN_SOCK_H_ */

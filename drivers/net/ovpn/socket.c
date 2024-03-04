@@ -43,17 +43,27 @@ static void ovpn_socket_release_kref(struct kref *kref)
  * This function is only used internally. Users willing to release
  * references to the ovpn_socket should use ovpn_socket_release()
  */
-static void ovpn_socket_put(struct ovpn_socket *sock)
+static void ovpn_socket_put(struct ovpn_peer *peer)
 {
-	kref_put(&sock->refcount, ovpn_socket_release_kref);
+	kref_put(&peer->sock->refcount, ovpn_socket_release_kref);
+
+	/* At this point we can tell the netlink code that the
+	 * peer_del_doit() can terminate.
+	 *
+	 * This is most important when the above put() brought
+	 * the refcounter to 0, thus triggering the socket detach
+	 * via ovpn_socket_release_kref(): peer deletion should
+	 * not terminate if the socket detach is still ongoing.
+	 */
+	complete(&peer->sock_detach);
 }
 
 /**
  * ovpn_socket_release - release resources owned by socket user
- * @sock: the socket to process
+ * @peer: peer whose socket should be released
  *
- * This function should be invoked when the user is shutting
- * down and wants to drop its link to the socket.
+ * This function should be invoked when the peer is being removed
+ * and wants to drop its link to the socket.
  *
  * In case of UDP, the detach routine will drop a reference to the
  * ovpn netdev, pointed by the ovpn_socket.
@@ -64,7 +74,7 @@ static void ovpn_socket_put(struct ovpn_socket *sock)
  *
  * NOTE: this function may sleep
  */
-void ovpn_socket_release(struct ovpn_socket *sock)
+void ovpn_socket_release(struct ovpn_peer *peer)
 {
 	/* Drop the reference while holding the sock lock to avoid
 	 * concurrent ovpn_socket_new call to mess up with a partially
@@ -73,9 +83,9 @@ void ovpn_socket_release(struct ovpn_socket *sock)
 	 * Holding the lock ensures that a socket with refcnt 0 is fully
 	 * detached before it can be picked by a concurrent reader.
 	 */
-	lock_sock(sock->sock->sk);
-	ovpn_socket_put(sock);
-	release_sock(sock->sock->sk);
+	lock_sock(peer->sock->sock->sk);
+	ovpn_socket_put(peer);
+	release_sock(peer->sock->sock->sk);
 }
 
 static bool ovpn_socket_hold(struct ovpn_socket *sock)
