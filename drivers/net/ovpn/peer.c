@@ -197,6 +197,7 @@ void ovpn_peer_float(struct ovpn_peer *peer, struct sk_buff *skb)
 		   peer->id, &ss);
 	ovpn_peer_reset_sockaddr(peer, (struct sockaddr_storage *)&ss,
 				 local_ip);
+	ovpn_nl_peer_float_notify(peer);
 
 	/* rehashing is required only in MP mode as P2P has one peer
 	 * only and thus there is no hashtable

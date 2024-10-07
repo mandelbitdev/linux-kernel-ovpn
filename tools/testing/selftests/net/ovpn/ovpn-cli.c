@@ -12,6 +12,8 @@
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
+#include <time.h>
+#include <poll.h>
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <netinet/in.h>
@@ -107,6 +109,20 @@ struct ovpn_ctx {
 	enum ovpn_key_direction key_dir;
 	enum ovpn_key_slot key_slot;
 	int key_id;
+};
+
+struct mcast_cb_data {
+	int ret;
+	const struct ovpn_ctx *ovpn;
+};
+
+struct float_peer {
+	__u32 id;
+	sa_family_t sa_family;
+	union {
+		struct sockaddr_in in4;
+		struct sockaddr_in6 in6;
+	} addr;
 };
 
 static int ovpn_nl_recvmsgs(struct nl_ctx *ctx)
@@ -1063,6 +1079,44 @@ static int mcast_ack_handler(struct nl_msg *msg, void *arg)
 	return NL_STOP;
 }
 
+static int ovpn_parse_float_msg(struct nlattr *attrs[], struct float_peer *peer)
+{
+	__u16 port;
+	struct nlattr *fp_attrs[OVPN_A_PEER_MAX + 1];
+
+	if (nla_parse_nested(fp_attrs, OVPN_A_PEER_MAX + 1, attrs[OVPN_A_PEER], NULL) ||
+	    !fp_attrs[OVPN_A_PEER_ID] || !fp_attrs[OVPN_A_PEER_REMOTE_PORT]) {
+		fprintf(stderr,
+			"listen_float: received bogus packet data from ovpn\n");
+		return -1;
+	}
+
+	peer->id = nla_get_u32(fp_attrs[OVPN_A_PEER_ID]);
+	port = ntohs(nla_get_u16(fp_attrs[OVPN_A_PEER_REMOTE_PORT]));
+
+	if (fp_attrs[OVPN_A_PEER_REMOTE_IPV4]) {
+		__u32 addr = nla_get_u32(fp_attrs[OVPN_A_PEER_REMOTE_IPV4]);
+
+		peer->addr.in4.sin_family = AF_INET;
+		peer->addr.in4.sin_port = port;
+		peer->addr.in4.sin_addr.s_addr = addr;
+	} else if (fp_attrs[OVPN_A_PEER_REMOTE_IPV6]) {
+		memcpy(&peer->addr.in6.sin6_addr,
+		       nla_data(fp_attrs[OVPN_A_PEER_REMOTE_IPV6]),
+		       sizeof(peer->addr.in6.sin6_addr));
+		peer->addr.in6.sin6_family = AF_INET6;
+		peer->addr.in6.sin6_port = port;
+		if (fp_attrs[OVPN_A_PEER_REMOTE_IPV6_SCOPE_ID])
+			peer->addr.in6.sin6_scope_id = nla_get_u32(
+				fp_attrs[OVPN_A_PEER_REMOTE_IPV6_SCOPE_ID]);
+	} else {
+		fprintf(stderr,
+			"listen_float: missing peer address data from float packet\n");
+		return -1;
+	}
+	return 0;
+}
+
 static int ovpn_handle_msg(struct nl_msg *msg, void *arg)
 {
 	struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
@@ -1114,12 +1168,94 @@ static int ovpn_handle_msg(struct nl_msg *msg, void *arg)
 	case OVPN_CMD_KEY_SWAP_NTF:
 		fprintf(stdout, "received CMD_KEY_SWAP_NTF\n");
 		break;
+	case OVPN_CMD_PEER_FLOAT_NTF:
+		fprintf(stdout, "received OVPN_CMD_PEER_FLOAT_NTF\n");
+		break;
 	default:
 		fprintf(stderr, "received unknown command: %d\n", gnlh->cmd);
 		return NL_STOP;
 	}
 
 	return NL_OK;
+}
+
+static int ovpn_handle_float_msg(struct nl_msg *msg, void *arg)
+{
+	struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
+	struct nlattr *attrs[OVPN_A_MAX + 1];
+	struct nlmsghdr *nlh = nlmsg_hdr(msg);
+	char ifname[IF_NAMESIZE];
+	__u32 ifindex;
+	struct mcast_cb_data *cb_data = (struct mcast_cb_data *)arg;
+	const struct ovpn_ctx *ctx = cb_data->ovpn;
+
+	cb_data->ret = NL_OK;
+
+	if (!genlmsg_valid_hdr(nlh, 0)) {
+		fprintf(stderr, "listen_float: invalid header\n");
+		return NL_SKIP;
+	}
+
+	if (nla_parse(attrs, OVPN_A_MAX, genlmsg_attrdata(gnlh, 0),
+		      genlmsg_attrlen(gnlh, 0), NULL)) {
+		fprintf(stderr,
+			"listen_float: received bogus data from ovpn-dco\n");
+		return NL_SKIP;
+	}
+
+	if (!attrs[OVPN_A_IFINDEX]) {
+		fprintf(stderr, "listen_float: no ifindex in this message\n");
+		return NL_SKIP;
+	}
+
+	ifindex = nla_get_u32(attrs[OVPN_A_IFINDEX]);
+	if (!if_indextoname(ifindex, ifname)) {
+		fprintf(stderr,
+			"listen_float: cannot resolve ifname for ifindex: %u\n",
+			ifindex);
+		return NL_SKIP;
+	}
+
+	if (gnlh->cmd == OVPN_CMD_PEER_FLOAT_NTF) {
+		if (ctx) {
+			struct float_peer peer = { 0 };
+
+			if (ovpn_parse_float_msg(attrs, &peer) < 0 ||
+			    peer.id != ctx->peer_id) {
+				return NL_SKIP;
+			}
+
+			if (ctx->sa_family == AF_INET) {
+				if (peer.addr.in4.sin_family != AF_INET ||
+				    peer.addr.in4.sin_port !=
+					    ntohs(ctx->remote.in4.sin_port) ||
+				    peer.addr.in4.sin_addr.s_addr !=
+					    ctx->remote.in4.sin_addr.s_addr) {
+					cb_data->ret = NL_STOP;
+				}
+			} else if (ctx->sa_family == AF_INET6) {
+				if (peer.addr.in6.sin6_family != AF_INET6 ||
+				    peer.addr.in6.sin6_port !=
+					    ntohs(ctx->remote.in6.sin6_port) ||
+				    memcmp(&peer.addr.in6.sin6_addr,
+					   &ctx->remote.in6.sin6_addr,
+					   sizeof(struct in6_addr)) != 0) {
+					fprintf(stderr,
+						"listen_float: peer %u address mismatch\n",
+						ctx->peer_id);
+					cb_data->ret = NL_STOP;
+				}
+			} else {
+				fprintf(stderr,
+					"listen_float: unknown socket family\n");
+				cb_data->ret = NL_STOP;
+			}
+		} else {
+			fprintf(stderr, "listen_float: missing user data\n");
+			cb_data->ret = NL_STOP;
+		}
+	}
+	return cb_data->ret;
 }
 
 static int ovpn_get_mcast_id(struct nl_sock *sock, const char *family,
@@ -1220,11 +1356,101 @@ err_free:
 	nl_socket_free(sock);
 }
 
+static int ovpn_listen_float(const struct ovpn_ctx *ctx, const int timeout_s)
+{
+	struct nl_sock *sock;
+	struct nl_cb *cb;
+	int mcid;
+	time_t start_time, current_time;
+	struct pollfd fds[1];
+	struct mcast_cb_data cb_data = {
+		.ret = -1,
+		.ovpn = ctx,
+	};
+
+	start_time = time(NULL);
+
+	sock = nl_socket_alloc();
+	if (!sock) {
+		fprintf(stderr, "cannot allocate netlink socket\n");
+		goto err_free;
+	}
+
+	nl_socket_set_buffer_size(sock, 8192, 8192);
+
+	cb_data.ret = genl_connect(sock);
+	if (cb_data.ret < 0) {
+		fprintf(stderr, "cannot connect to generic netlink: %s\n",
+			nl_geterror(cb_data.ret));
+		goto err_free;
+	}
+
+	mcid = ovpn_get_mcast_id(sock, OVPN_FAMILY_NAME, OVPN_MCGRP_PEERS);
+	if (mcid < 0) {
+		fprintf(stderr, "cannot get mcast group: %s\n",
+			nl_geterror(mcid));
+		goto err_free;
+	}
+
+	cb_data.ret = nl_socket_add_membership(sock, mcid);
+	if (cb_data.ret) {
+		fprintf(stderr, "failed to join mcast group: %d\n",
+			cb_data.ret);
+		goto err_free;
+	}
+
+	cb_data.ret = 0;
+	cb = nl_cb_alloc(NL_CB_DEFAULT);
+	nl_cb_set(cb, NL_CB_SEQ_CHECK, NL_CB_CUSTOM, nl_seq_check, NULL);
+	nl_cb_set(cb, NL_CB_VALID, NL_CB_CUSTOM, ovpn_handle_float_msg,
+		  &cb_data);
+	nl_cb_err(cb, NL_CB_CUSTOM, ovpn_nl_cb_error, &cb_data.ret);
+
+	/* Setup poll to monitor the socket for input */
+	fds[0].fd = nl_socket_get_fd(sock);
+	fds[0].events = POLLIN;
+
+	while (cb_data.ret != -EINTR && cb_data.ret != NL_STOP) {
+		current_time = time(NULL);
+		if ((int)difftime(current_time, start_time) >= timeout_s) {
+			break;
+		}
+
+		int poll_ret = poll(fds, 1, 100);
+		if (poll_ret == -1) {
+			fprintf(stderr, "listen_float: poll failed");
+			cb_data.ret = -1;
+			break;
+		} else if (poll_ret == 0) {
+			continue;
+		}
+
+		if (fds[0].revents & POLLIN) {
+			int ret = nl_recvmsgs(sock, cb);
+			if (ret < 0) {
+				fprintf(stderr,
+					"listen_float: error receiving messages: %s\n",
+					nl_geterror(cb_data.ret));
+				cb_data.ret = -1;
+				break;
+			}
+			if (cb_data.ret == NL_OK) {
+				break;
+			}
+		}
+	}
+
+	nl_cb_put(cb);
+err_free:
+	nl_socket_free(sock);
+	return cb_data.ret;
+}
+
 static void usage(const char *cmd)
 {
 	fprintf(stderr, "Error: invalid arguments.\n\n");
 	fprintf(stderr,
-		"Usage %s <iface> <connect|listen|new_peer|new_multi_peer|set_peer|del_peer|new_key|del_key|recv|send|listen_mcast> [arguments..]\n",
+		"Usage %s <iface> <connect|listen|new_peer|new_multi_peer|set_peer|del_peer|new_key|del_key|recv|send|listen_mcast|listen_float> [arguments..]\n",
 		cmd);
 	fprintf(stderr, "\tiface: tun interface name\n\n");
 
@@ -1288,6 +1514,14 @@ static void usage(const char *cmd)
 
 	fprintf(stderr,
 		"* listen_mcast: listen to ovpn-dco netlink multicast messages\n");
+
+	fprintf(stderr,
+		"* listen_float <peer-id> <af> <addr> <port> [timeout]: listen to ovpn-dco netlink multicast messages and match the data with user input\n");
+	fprintf(stderr, "\tpeer-id: peer ID of the peer to match\n");
+	fprintf(stderr, "\taf: address family to match ('4' or '6')\n");
+	fprintf(stderr, "\taddr: IP address to match\n");
+	fprintf(stderr, "\tport: port\n");
+	fprintf(stderr, "\ttimeout: timeout in seconds (default: 10)\n");
 }
 
 static int ovpn_parse_remote(struct ovpn_ctx *ovpn, const char *host,
@@ -1813,6 +2047,36 @@ int main(int argc, char *argv[])
 		}
 	} else if (!strcmp(argv[1], "listen_mcast")) {
 		ovpn_listen_mcast();
+	} else if (!strcmp(argv[1], "listen_float")) {
+		if (argc < 7) {
+			usage(argv[0]);
+			return -1;
+		}
+
+		int af = atoi(argv[4]);
+		if (af == 4) {
+			ovpn.sa_family = AF_INET;
+		} else if (af == 6) {
+			ovpn.sa_family = AF_INET6;
+		} else {
+			fprintf(stderr, "invalid address family: %d\n", af);
+			return -1;
+		}
+
+		int timeout_s = argv[7] ? atoi(argv[7]) : 10;
+		if (timeout_s < 1 || timeout_s > 60) {
+			fprintf(stderr,
+				"invalid timeout: %d (must be between 1 and 60)\n",
+				timeout_s);
+			return -1;
+		}
+
+		int ret = ovpn_parse_new_peer(&ovpn, argv[3], argv[5], argv[6],
+					      NULL);
+		if (ret < 0)
+			return ret;
+
+		return ovpn_listen_float(&ovpn, timeout_s);
 	} else {
 		usage(argv[0]);
 		return -1;
