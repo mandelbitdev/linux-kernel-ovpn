@@ -108,13 +108,24 @@ done
 for p in $(seq 1 ${NUM_PEERS}); do
 	ip netns exec peer0 ping -qfc 1000 -w 5 5.5.5.$((${p} + 1))
 done
-# make clients float..
+# make clients float and listen for notifications...
 for p in $(seq 1 ${NUM_PEERS}); do
+	ip netns exec peer0 ./ovpn-cli listen_float tun0 ${p} 4 10.10.${p}.3 1 &
+	listener_pids="${listener_pids} $!"
 	ip -n peer${p} addr del 10.10.${p}.2/24 dev veth${p}
 	ip -n peer${p} addr add 10.10.${p}.3/24 dev veth${p}
 done
 for p in $(seq 1 ${NUM_PEERS}); do
 	ip netns exec peer${p} ping -qfc 1000 -w 5 5.5.5.1
+done
+
+# wait for listeners to finish
+for pid in ${listener_pids}; do
+	if ! wait ${pid}; then
+		echo "Mismatch detected between the expected data and the float message"
+		cleanup
+		exit 1
+	fi
 done
 
 cleanup

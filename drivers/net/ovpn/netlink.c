@@ -959,6 +959,81 @@ err_free_msg:
 }
 
 /**
+ * ovpn_nl_float_peer_notify - notify userspace about peer floating
+ * @peer: the floated peer
+ *
+ * Return: 0 on success or a negative error code otherwise
+ */
+int ovpn_nl_peer_float_notify(struct ovpn_peer *peer)
+{
+	const struct ovpn_bind *bind;
+	union ovpn_sockaddr remote = { 0 };
+	struct nlattr *p_attr;
+	struct sk_buff *msg;
+	int ret = -EMSGSIZE;
+	void *hdr;
+
+	msg = nlmsg_new(100, GFP_ATOMIC);
+	if (!msg)
+		return -ENOMEM;
+
+	hdr = genlmsg_put(msg, 0, 0, &ovpn_nl_family, 0,
+			  OVPN_CMD_PEER_FLOAT_NTF);
+	if (!hdr) {
+		ret = -ENOBUFS;
+		goto err_free_msg;
+	}
+
+	if (nla_put_u32(msg, OVPN_A_IFINDEX, peer->ovpn->dev->ifindex))
+		goto err_cancel_msg;
+
+	p_attr = nla_nest_start(msg, OVPN_A_PEER);
+	if (!p_attr)
+		goto err_cancel_msg;
+
+	if (nla_put_u32(msg, OVPN_A_PEER_ID, peer->id))
+		goto err_cancel_msg;
+
+	rcu_read_lock();
+	bind = rcu_dereference(peer->bind);
+	if (bind)
+		memcpy(&remote, &bind->remote, sizeof(union ovpn_sockaddr));
+	rcu_read_unlock();
+
+	if (remote.in4.sin_family == AF_INET) {
+		if (nla_put_in_addr(msg, OVPN_A_PEER_REMOTE_IPV4,
+				    remote.in4.sin_addr.s_addr) ||
+		    nla_put_net16(msg, OVPN_A_PEER_REMOTE_PORT,
+				  remote.in4.sin_port))
+			goto err_cancel_msg;
+	} else if (remote.in4.sin_family == AF_INET6) {
+		if (nla_put_in6_addr(msg, OVPN_A_PEER_REMOTE_IPV6,
+				     &remote.in6.sin6_addr) ||
+		    nla_put_u32(msg, OVPN_A_PEER_REMOTE_IPV6_SCOPE_ID,
+				remote.in6.sin6_scope_id) ||
+		    nla_put_net16(msg, OVPN_A_PEER_REMOTE_PORT,
+				  remote.in6.sin6_port))
+			goto err_cancel_msg;
+	} else {
+		goto err_cancel_msg;
+	}
+
+	nla_nest_end(msg, p_attr);
+	genlmsg_end(msg, hdr);
+
+	genlmsg_multicast_netns(&ovpn_nl_family, dev_net(peer->ovpn->dev), msg,
+				0, OVPN_NLGRP_PEERS, GFP_ATOMIC);
+
+	return 0;
+
+err_cancel_msg:
+	genlmsg_cancel(msg, hdr);
+err_free_msg:
+	nlmsg_free(msg);
+	return ret;
+}
+
+/**
  * ovpn_nl_key_swap_notify - notify userspace peer's key must be renewed
  * @peer: the peer whose key needs to be renewed
  * @key_id: the ID of the key that needs to be renewed
