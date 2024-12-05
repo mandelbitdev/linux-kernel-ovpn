@@ -12,6 +12,8 @@
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
+#include <time.h>
+#include <poll.h>
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <netinet/in.h>
@@ -62,6 +64,8 @@ enum ovpn_key_direction {
 #define NONCE_LEN 8
 
 #define PEER_ID_UNDEF 0x00FFFFFF
+
+#define LISTEN_MCAST_TIMEOUT_S 30
 
 struct nl_ctx {
 	struct nl_sock *nl_sock;
@@ -131,6 +135,8 @@ struct ovpn_ctx {
 	int key_id;
 
 	const char *peers_file;
+
+	__u8 listen_mcast_timeout_s;
 };
 
 static int ovpn_nl_recvmsgs(struct nl_ctx *ctx)
@@ -1589,11 +1595,13 @@ static int ovpn_get_mcast_id(struct nl_sock *sock, const char *family,
 	return ret;
 }
 
-static int ovpn_listen_mcast(void)
+static int ovpn_listen_mcast(const struct ovpn_ctx *ovpn)
 {
 	struct nl_sock *sock;
 	struct nl_cb *cb;
-	int mcid, ret;
+	int mcid, ret, poll_ret;
+	time_t start_time, current_time;
+	struct pollfd fds[1];
 
 	sock = nl_socket_alloc();
 	if (!sock) {
@@ -1629,15 +1637,38 @@ static int ovpn_listen_mcast(void)
 	nl_cb_set(cb, NL_CB_VALID, NL_CB_CUSTOM, ovpn_handle_msg, &ret);
 	nl_cb_err(cb, NL_CB_CUSTOM, ovpn_nl_cb_error, &ret);
 
-	while (ret == 1) {
-		int err = nl_recvmsgs(sock, cb);
+	start_time = time(NULL);
 
-		if (err < 0) {
-			fprintf(stderr,
-				"cannot receive netlink message: (%d) %s\n",
-				err, nl_geterror(-err));
-			ret = -1;
+	/* Setup poll to monitor the socket for input */
+	fds[0].fd = nl_socket_get_fd(sock);
+	fds[0].events = POLLIN;
+
+	while (true) {
+		current_time = time(NULL);
+		if ((int)difftime(current_time, start_time) >=
+		    ovpn->listen_mcast_timeout_s) {
+			ret = 0;
 			break;
+		}
+
+		poll_ret = poll(fds, 1, 100);
+		if (poll_ret == -1) {
+			ret = -errno;
+			break;
+		} else if (poll_ret == 0) {
+			continue;
+		}
+
+		if (fds[0].revents & POLLIN) {
+			int err = nl_recvmsgs(sock, cb);
+
+			if (err < 0) {
+				fprintf(stderr,
+					"cannot receive netlink message: (%d) %s\n",
+					err, nl_geterror(-err));
+				ret = -1;
+				break;
+			}
 		}
 	}
 
@@ -1749,7 +1780,9 @@ static void usage(const char *cmd)
 	fprintf(stderr, "\tpeer_id: peer ID of the peer to modify\n");
 
 	fprintf(stderr,
-		"* listen_mcast: listen to ovpn netlink multicast messages\n");
+		"* listen_mcast <time>: listen to ovpn netlink multicast messages\n");
+	fprintf(stderr,
+		"\ttime: duration (in seconds) to listen for messages\n");
 }
 
 static int ovpn_parse_remote(struct ovpn_ctx *ovpn, const char *host,
@@ -1934,7 +1967,7 @@ static enum ovpn_cmd ovpn_parse_cmd(const char *cmd)
 static int ovpn_run_cmd(struct ovpn_ctx *ovpn)
 {
 	char peer_id[10], vpnip[INET6_ADDRSTRLEN], raddr[128], rport[10];
-	int n, ret;
+	int n, ret = -1;
 	FILE *fp;
 
 	switch (ovpn->cmd) {
@@ -2087,7 +2120,7 @@ static int ovpn_run_cmd(struct ovpn_ctx *ovpn)
 		ret = ovpn_swap_keys(ovpn);
 		break;
 	case CMD_LISTEN_MCAST:
-		ret = ovpn_listen_mcast();
+		ret = ovpn_listen_mcast(ovpn);
 		break;
 	case CMD_INVALID:
 		break;
@@ -2100,24 +2133,22 @@ static int ovpn_parse_cmd_args(struct ovpn_ctx *ovpn, int argc, char *argv[])
 {
 	int ret;
 
-	/* no args required for LISTEN_MCAST */
-	if (ovpn->cmd == CMD_LISTEN_MCAST)
-		return 0;
+	if (ovpn->cmd != CMD_LISTEN_MCAST) {
+		/* all commands need an ifname */
+		if (argc < 3)
+			return -EINVAL;
 
-	/* all commands need an ifname */
-	if (argc < 3)
-		return -EINVAL;
+		strscpy(ovpn->ifname, argv[2], IFNAMSIZ - 1);
+		ovpn->ifname[IFNAMSIZ - 1] = '\0';
 
-	strscpy(ovpn->ifname, argv[2], IFNAMSIZ - 1);
-	ovpn->ifname[IFNAMSIZ - 1] = '\0';
-
-	/* all commands, except NEW_IFNAME, needs an ifindex */
-	if (ovpn->cmd != CMD_NEW_IFACE) {
-		ovpn->ifindex = if_nametoindex(ovpn->ifname);
-		if (!ovpn->ifindex) {
-			fprintf(stderr, "cannot find interface: %s\n",
-				strerror(errno));
-			return -1;
+		/* all commands, except NEW_IFNAME, need an ifindex */
+		if (ovpn->cmd != CMD_NEW_IFACE) {
+			ovpn->ifindex = if_nametoindex(ovpn->ifname);
+			if (!ovpn->ifindex) {
+				fprintf(stderr, "cannot find interface: %s\n",
+					strerror(errno));
+				return -1;
+			}
 		}
 	}
 
@@ -2322,6 +2353,22 @@ static int ovpn_parse_cmd_args(struct ovpn_ctx *ovpn, int argc, char *argv[])
 		}
 		break;
 	case CMD_LISTEN_MCAST:
+		if (argc > 3)
+			return -EINVAL;
+
+		ovpn->listen_mcast_timeout_s = LISTEN_MCAST_TIMEOUT_S;
+		if (argc == 3) {
+			ovpn->listen_mcast_timeout_s =
+				strtoul(argv[2], NULL, 10);
+			if (errno == ERANGE ||
+			    ovpn->listen_mcast_timeout_s == 0 ||
+			    ovpn->listen_mcast_timeout_s > 60) {
+				fprintf(stderr,
+					"timeout value '%s' out of range\n",
+					argv[2]);
+				return -EINVAL;
+			}
+		}
 		break;
 	case CMD_INVALID:
 		break;
