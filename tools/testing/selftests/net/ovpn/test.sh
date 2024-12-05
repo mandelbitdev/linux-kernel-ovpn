@@ -69,6 +69,32 @@ add_peer() {
 	fi
 }
 
+check_ntfs() {
+	# peer 0 notifications
+	if [ ${1} -eq 0 ]; then
+		for p in $(seq 1 ${NUM_PEERS}); do
+			if [ ${p} -eq 1 ]; then
+				grep -q "PEER_DEL_NTF ifname=tun0 reason=2 id=1" ${ntfs_file}
+			else
+				grep -q "PEER_DEL_NTF ifname=tun0 reason=3 id=${p}" ${ntfs_file}
+			fi
+
+			if [ "$FLOAT" == "1" ]; then
+				part1="PEER_FLOAT_NTF ifname=tun0 peer_id=${p} sa_family=AF_INET"
+				part2="address=10.10.${p}.3 port=1"
+				grep -q "${part1} ${part2}" ${ntfs_file}
+			fi
+		done
+	# peer 1 notifications
+	elif [ ${1} -eq 1 ]; then
+		grep -q "PEER_DEL_NTF ifname=tun1 reason=2 id=1" ${ntfs_file}
+		grep -q "KEY_SWAP_NTF ifname=tun1 peer_id=1 key_id=1" ${ntfs_file}
+	# all other peers notifications
+	else
+		grep -q "PEER_DEL_NTF ifname=tun${1} reason=3 id=${1}" ${ntfs_file}
+	fi
+}
+
 cleanup() {
 	# first test peers disconnect on down event
 	for p in $(seq 0 10); do
@@ -81,6 +107,9 @@ cleanup() {
 		ip netns exec peer${p} ${OVPN_CLI} del_iface tun${p} 2>/dev/null || true
 		ip netns del peer${p} 2>/dev/null || true
 	done
+	if [ -f ${ntfs_file} ]; then
+		rm -f ${ntfs_file} || true
+	fi
 }
 
 if [ "${PROTO}" == "UDP" ]; then
@@ -91,7 +120,12 @@ fi
 
 cleanup
 
-modprobe -q ovpn || true
+modprobe -r ovpn || true
+modprobe -q ovpn pid_bits=17 || true
+
+# trap cleanup EXIT
+
+ntfs_file=$(mktemp)
 
 for p in $(seq 0 ${NUM_PEERS}); do
 	create_ns ${p}
@@ -112,6 +146,12 @@ done
 
 for p in $(seq 1 ${NUM_PEERS}); do
 	ip netns exec peer0 ping -qfc 1000 -w 5 5.5.5.$((${p} + 1))
+done
+
+# write all netlink notifications to a file
+for p in $(seq 0 ${NUM_PEERS}); do
+	ip netns exec peer${p} ${OVPN_CLI} listen_mcast 35 1>>${ntfs_file} 2>/dev/null &
+	listener_pids[${p}]=$!
 done
 
 if [ "$FLOAT" == "1" ]; then
@@ -143,6 +183,33 @@ ip netns exec peer1 ${OVPN_CLI} get_peer tun1
 
 echo "Querying peer 1:"
 ip netns exec peer0 ${OVPN_CLI} get_peer tun0 1
+
+echo "Triggering a key swap notification:"
+ip netns exec peer0 iperf3 -s -B 5.5.5.1 &
+key_swap_iperf_pids[${#key_swap_iperf_pids[@]}]=$!
+sleep 1
+ip netns exec peer1 iperf3 -Z -b 0 -u -l 64 -t inf -c 5.5.5.1%tun1 &
+key_swap_iperf_pids[${#key_swap_iperf_pids[@]}]=$!
+
+while true; do
+	if journalctl -kfS -10sec | grep -q "killing key 1 for peer 1"; then
+		echo "Key swap notification received"
+		for p in ${key_swap_iperf_pids[@]}; do
+			kill ${p}
+		done
+		break
+	fi
+	sleep 1
+done
+
+echo "Deleting consumed key and adding new one:"
+ip netns exec peer0 ${OVPN_CLI} del_key tun0 1 1
+ip netns exec peer1 ${OVPN_CLI} del_key tun1 1 1
+ip netns exec peer0 ${OVPN_CLI} new_key tun0 1 1 2 ${ALG} 0 data64.key
+ip netns exec peer1 ${OVPN_CLI} new_key tun1 1 1 2 ${ALG} 1 data64.key
+
+# checking communication after key swap
+ip netns exec peer0 ping -qfc 1000 -w 1 5.5.5.2
 
 echo "Querying non-existent peer 10:"
 ip netns exec peer0 ${OVPN_CLI} get_peer tun0 10 || true
@@ -176,6 +243,20 @@ for p in $(seq 2 ${NUM_PEERS}); do
 	ip netns exec peer${p} ${OVPN_CLI} set_peer tun${p} ${p} 5 5
 done
 sleep 7
+echo "Waiting for listeners to finish:"
+for l in ${listener_pids[@]}; do
+	wait ${l}
+done
+
+echo "Checking received notifications:"
+for p in $(seq 0 ${NUM_PEERS}); do
+	if [ ! -f ${ntfs_file} ]; then
+		echo "missing notification file"
+		exit 1
+	fi
+
+	check_ntfs ${p}
+done
 
 cleanup
 

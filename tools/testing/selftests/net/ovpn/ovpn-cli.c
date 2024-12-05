@@ -1479,17 +1479,100 @@ static int mcast_ack_handler(struct nl_msg (*msg)__always_unused, void *arg)
 	return NL_STOP;
 }
 
+static bool ovpn_parse_peer_del_ntf(const char *ifname, struct nlattr **attrs)
+{
+	struct nlattr *nest_attrs[OVPN_A_PEER_MAX + 1];
+
+	if (nla_parse_nested(nest_attrs, OVPN_A_PEER_MAX + 1,
+			     attrs[OVPN_A_PEER], NULL) ||
+	    !nest_attrs[OVPN_A_PEER_DEL_REASON] ||
+	    !nest_attrs[OVPN_A_PEER_ID]) {
+		fprintf(stderr, "received bogus packet data from ovpn\n");
+		return false;
+	}
+
+	fprintf(stdout, "PEER_DEL_NTF ifname=%s reason=%u id=%u\n", ifname,
+		nla_get_u8(nest_attrs[OVPN_A_PEER_DEL_REASON]),
+		nla_get_u32(nest_attrs[OVPN_A_PEER_ID]));
+	return true;
+}
+
+static bool ovpn_parse_key_swap_ntf(const char *ifname, struct nlattr **attrs)
+{
+	struct nlattr *nest_attrs[OVPN_A_MAX + 1];
+
+	if (nla_parse_nested(nest_attrs, OVPN_A_MAX + 1, attrs[OVPN_A_KEYCONF],
+			     NULL) ||
+	    !nest_attrs[OVPN_A_KEYCONF_PEER_ID] ||
+	    !nest_attrs[OVPN_A_KEYCONF_KEY_ID]) {
+		fprintf(stderr, "received bogus packet data from ovpn\n");
+		return false;
+	}
+
+	fprintf(stdout, "KEY_SWAP_NTF ifname=%s peer_id=%u key_id=%u\n", ifname,
+		nla_get_u32(nest_attrs[OVPN_A_KEYCONF_PEER_ID]),
+		nla_get_u16(nest_attrs[OVPN_A_KEYCONF_KEY_ID]));
+	return true;
+}
+
+static bool ovpn_parse_float_ntf(const char *ifname, struct nlattr **attrs)
+{
+	__u16 port;
+	__u32 peer_id;
+	struct in_addr in4;
+	struct in6_addr in6;
+	char buf[INET6_ADDRSTRLEN];
+	struct nlattr *fp_attrs[OVPN_A_PEER_MAX + 1];
+
+	if (nla_parse_nested(fp_attrs, OVPN_A_PEER_MAX + 1, attrs[OVPN_A_PEER],
+			     NULL) ||
+	    !fp_attrs[OVPN_A_PEER_ID] || !fp_attrs[OVPN_A_PEER_REMOTE_PORT]) {
+		fprintf(stderr, "received bogus packet data from ovpn\n");
+		return false;
+	}
+
+	peer_id = nla_get_u32(fp_attrs[OVPN_A_PEER_ID]);
+	port = nla_get_u16(fp_attrs[OVPN_A_PEER_REMOTE_PORT]);
+
+	if (fp_attrs[OVPN_A_PEER_REMOTE_IPV4]) {
+		in4.s_addr = nla_get_u32(fp_attrs[OVPN_A_PEER_REMOTE_IPV4]);
+
+		if (!inet_ntop(AF_INET, &in4, buf, sizeof(buf))) {
+			fprintf(stderr, "cannot convert IPv4 address\n");
+			return false;
+		}
+
+		fprintf(stdout,
+			"PEER_FLOAT_NTF ifname=%s peer_id=%u sa_family=AF_INET address=%s port=%u\n",
+			ifname, peer_id, buf, ntohs(port));
+	} else if (fp_attrs[OVPN_A_PEER_REMOTE_IPV6]) {
+		memcpy(&in6, nla_data(fp_attrs[OVPN_A_PEER_REMOTE_IPV6]),
+		       sizeof(in6));
+
+		if (!inet_ntop(AF_INET6, &in6, buf, sizeof(buf))) {
+			fprintf(stderr, "cannot convert IPv6 address\n");
+			return false;
+		}
+
+		fprintf(stdout,
+			"PEER_FLOAT_NTF ifname=%s peer_id=%u sa_family=AF_INET6 address=%s port=%u scope-id=%u\n",
+			ifname, peer_id, buf, ntohs(port),
+			nla_get_u32(fp_attrs[OVPN_A_PEER_REMOTE_IPV6_SCOPE_ID]));
+	} else {
+		fprintf(stderr, "received bogus packet data from ovpn\n");
+		return false;
+	}
+	return true;
+}
+
 static int ovpn_handle_msg(struct nl_msg *msg, void *arg)
 {
 	struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
 	struct nlattr *attrs[OVPN_A_MAX + 1];
 	struct nlmsghdr *nlh = nlmsg_hdr(msg);
-	//enum ovpn_del_peer_reason reason;
 	char ifname[IF_NAMESIZE];
 	int *ret = arg;
 	__u32 ifindex;
-
-	fprintf(stderr, "received message from ovpn-dco\n");
 
 	*ret = -1;
 
@@ -1518,23 +1601,16 @@ static int ovpn_handle_msg(struct nl_msg *msg, void *arg)
 
 	switch (gnlh->cmd) {
 	case OVPN_CMD_PEER_DEL_NTF:
-		/*if (!attrs[OVPN_A_DEL_PEER_REASON]) {
-		 *	fprintf(stderr, "no reason in DEL_PEER message\n");
-		 *	return NL_STOP;
-		 *}
-		 *
-		 *reason = nla_get_u8(attrs[OVPN_A_DEL_PEER_REASON]);
-		 *fprintf(stderr,
-		 *	"received CMD_DEL_PEER, ifname: %s reason: %d\n",
-		 *	ifname, reason);
-		 */
-		fprintf(stdout, "received CMD_PEER_DEL_NTF\n");
+		if (!ovpn_parse_peer_del_ntf(ifname, attrs))
+			return NL_STOP;
 		break;
 	case OVPN_CMD_PEER_FLOAT_NTF:
-		fprintf(stdout, "received CMD_PEER_FLOAT_NTF\n");
+		if (!ovpn_parse_float_ntf(ifname, attrs))
+			return NL_STOP;
 		break;
 	case OVPN_CMD_KEY_SWAP_NTF:
-		fprintf(stdout, "received CMD_KEY_SWAP_NTF\n");
+		if (!ovpn_parse_key_swap_ntf(ifname, attrs))
+			return NL_STOP;
 		break;
 	default:
 		fprintf(stderr, "received unknown command: %d\n", gnlh->cmd);
