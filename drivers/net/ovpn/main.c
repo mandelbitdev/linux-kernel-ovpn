@@ -25,6 +25,16 @@
 #include "proto.h"
 #include "tcp.h"
 
+/* pid_bits is used to lower the packet ID saturation value, thus allowing to
+ * trigger a KEY_SWAP_NTF easily
+ */
+int pid_bits = 32;
+#ifdef CONFIG_OVPN_TEST
+module_param(pid_bits, int, 0);
+MODULE_PARM_DESC(pid_bits,
+	"Set the number of bits used to determine the maximum packet ID (default 32)");
+#endif
+
 static void ovpn_priv_free(struct net_device *net)
 {
 	struct ovpn_priv *ovpn = netdev_priv(net);
@@ -303,6 +313,11 @@ static struct notifier_block ovpn_netdev_notifier = {
 
 static int __init ovpn_init(void)
 {
+	if (pid_bits < 8 || pid_bits > 32) {
+		pr_err("ovpn: invalid pid_bits value: %d\n", pid_bits);
+		return -EINVAL;
+	}
+
 	int err = register_netdevice_notifier(&ovpn_netdev_notifier);
 
 	if (err) {

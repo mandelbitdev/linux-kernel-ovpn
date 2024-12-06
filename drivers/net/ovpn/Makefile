@@ -6,6 +6,10 @@
 #
 # Author:	Antonio Quartulli <antonio@openvpn.net>
 
+ifdef CONFIG_OVPN_DEBUG
+ccflags-y += -DDEBUG -DOVPN_DEBUG
+endif
+
 obj-$(CONFIG_OVPN) := ovpn.o
 ovpn-y += bind.o
 ovpn-y += crypto.o

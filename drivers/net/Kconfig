@@ -130,6 +130,22 @@ config OVPN
 	  This module enhances the performance of the OpenVPN userspace software
 	  by offloading the data channel processing to kernelspace.
 
+config OVPN_TEST
+	bool "Enable testing parameters"
+	depends on OVPN
+	default n
+	help
+	  Enable module parameters for testing/debugging.
+
+	  This option allows the OVPN kernel module to be built with additional
+	  module parameters. These parameters can be set during module loading
+	  to tweak internal settings for debugging or testing purposes.
+
+	  Note: Tweaking these parameters is not safe for production use.
+	  They should only be modified during testing or debugging sessions.
+
+	  Say N here unless you know what you're doing.
+
 config EQUALIZER
 	tristate "EQL (serial line load balancing) support"
 	help
