@@ -8,8 +8,6 @@
  */
 
 #include <linux/skbuff.h>
-#include <linux/list.h>
-#include <linux/hashtable.h>
 #include <net/ip6_route.h>
 
 #include "ovpnstruct.h"
@@ -21,6 +19,185 @@
 #include "netlink.h"
 #include "peer.h"
 #include "socket.h"
+
+static u32 ovpn_peer_transp_addr_obj_hashfn(const void *data, u32 len, u32 seed)
+{
+	const struct ovpn_peer *peer = data;
+
+	if (peer->bind->remote.in4.sin_family == AF_INET)
+		return jhash(&peer->bind->remote.in4.sin_addr,
+			     sizeof(struct in_addr), seed);
+
+	return jhash(&peer->bind->remote.in6.sin6_addr, sizeof(struct in6_addr),
+		     seed);
+}
+
+static int ovpn_peer_transp_addr_obj_cmpfn(struct rhashtable_compare_arg *arg,
+					   const void *obj)
+{
+	const struct in_addr *key4 = arg->key;
+	const struct ovpn_peer *peer = obj;
+
+	if (peer->bind->remote.in4.sin_family == AF_INET &&
+	    peer->bind->remote.in4.sin_addr.s_addr == key4->s_addr)
+		return 0;
+
+	const struct in6_addr *key6 = arg->key;
+
+	if (peer->bind->remote.in6.sin6_family == AF_INET6 &&
+	    ipv6_addr_equal(&peer->bind->remote.in6.sin6_addr, key6))
+		return 0;
+
+	return 1;
+}
+
+static u32 ovpn_peer_vpn_addr_obj_hashfn(const void *data, u32 len, u32 seed)
+{
+	const struct ovpn_peer_vpn_rht_wrapper *wrapper = data;
+
+	if (wrapper->peer->vpn_addrs.ipv4.s_addr != htonl(INADDR_ANY))
+		return jhash(&wrapper->peer->vpn_addrs.ipv4,
+			     sizeof(struct in_addr), seed);
+
+	return jhash(&wrapper->peer->vpn_addrs.ipv6, sizeof(struct in6_addr),
+		     seed);
+}
+
+static int ovpn_peer_vpn_addr_obj_cmpfn(struct rhashtable_compare_arg *arg,
+					const void *obj)
+{
+	const struct ovpn_peer_vpn_rht_wrapper *wrapper = obj;
+	const struct in_addr *key4 = arg->key;
+
+	if (wrapper->peer->vpn_addrs.ipv4.s_addr == key4->s_addr)
+		return 0;
+
+	const struct in6_addr *key6 = arg->key;
+
+	if (ipv6_addr_equal(&wrapper->peer->vpn_addrs.ipv6, key6))
+		return 0;
+
+	return 1;
+}
+
+static const struct rhashtable_params ovpn_peer_id_rhash_params = {
+	.key_len = sizeof(u32),
+	.key_offset = offsetof(struct ovpn_peer, id),
+	.head_offset = offsetof(struct ovpn_peer, rhash_entry_id),
+	.automatic_shrinking = true,
+};
+
+static const struct rhashtable_params ovpn_peer_transp_addr_rhash_params = {
+	.key_offset = offsetof(struct ovpn_peer, bind) +
+		      offsetof(struct ovpn_bind, remote),
+	.head_offset = offsetof(struct ovpn_peer, rhash_entry_transp_addr),
+	.automatic_shrinking = true,
+	.hashfn = jhash,
+	.obj_hashfn = ovpn_peer_transp_addr_obj_hashfn,
+	.obj_cmpfn = ovpn_peer_transp_addr_obj_cmpfn,
+};
+
+static const struct rhashtable_params ovpn_peer_transp_addr4_rhash_params = {
+	.key_len = sizeof(struct in_addr),
+	.key_offset = offsetof(struct ovpn_peer, bind) +
+		      offsetof(struct ovpn_bind, remote),
+	.head_offset = offsetof(struct ovpn_peer, rhash_entry_transp_addr),
+	.automatic_shrinking = true,
+	.hashfn = jhash,
+	.obj_hashfn = ovpn_peer_transp_addr_obj_hashfn,
+	.obj_cmpfn = ovpn_peer_transp_addr_obj_cmpfn,
+};
+
+static const struct rhashtable_params ovpn_peer_transp_addr6_rhash_params = {
+	.key_len = sizeof(struct in6_addr),
+	.key_offset = offsetof(struct ovpn_peer, bind) +
+		      offsetof(struct ovpn_bind, remote),
+	.head_offset = offsetof(struct ovpn_peer, rhash_entry_transp_addr),
+	.automatic_shrinking = true,
+	.hashfn = jhash,
+	.obj_hashfn = ovpn_peer_transp_addr_obj_hashfn,
+	.obj_cmpfn = ovpn_peer_transp_addr_obj_cmpfn,
+};
+
+static const struct rhashtable_params ovpn_peer_vpn_addr_rhash_params = {
+	.key_offset = offsetof(struct ovpn_peer_vpn_rht_wrapper, peer) +
+		      offsetof(struct ovpn_peer, vpn_addrs.ipv4),
+	.head_offset = offsetof(struct ovpn_peer_vpn_rht_wrapper, rhash_entry),
+	.automatic_shrinking = true,
+	.hashfn = jhash,
+	.obj_hashfn = ovpn_peer_vpn_addr_obj_hashfn,
+	.obj_cmpfn = ovpn_peer_vpn_addr_obj_cmpfn,
+};
+
+static const struct rhashtable_params ovpn_peer_vpn_addr4_rhash_params = {
+	.key_len = sizeof(struct in_addr),
+	.key_offset = offsetof(struct ovpn_peer_vpn_rht_wrapper, peer) +
+		      offsetof(struct ovpn_peer, vpn_addrs.ipv4),
+	.head_offset = offsetof(struct ovpn_peer_vpn_rht_wrapper, rhash_entry),
+	.automatic_shrinking = true,
+	.hashfn = jhash,
+	.obj_hashfn = ovpn_peer_vpn_addr_obj_hashfn,
+	.obj_cmpfn = ovpn_peer_vpn_addr_obj_cmpfn,
+};
+
+static const struct rhashtable_params ovpn_peer_vpn_addr6_rhash_params = {
+	.key_len = sizeof(struct in6_addr),
+	.key_offset = offsetof(struct ovpn_peer_vpn_rht_wrapper, peer) +
+		      offsetof(struct ovpn_peer, vpn_addrs.ipv4),
+	.head_offset = offsetof(struct ovpn_peer_vpn_rht_wrapper, rhash_entry),
+	.automatic_shrinking = true,
+	.hashfn = jhash,
+	.obj_hashfn = ovpn_peer_vpn_addr_obj_hashfn,
+	.obj_cmpfn = ovpn_peer_vpn_addr_obj_cmpfn,
+};
+
+/**
+ * ovpn_peers_rhashtables_init - initialize rhashtables for peer storage
+ * @ovpn: the openvpn instance to initialize the rhashtables for
+ *
+ * Return: 0 on success or a negative error code otherwise
+ */
+int ovpn_peers_rhashtables_init(struct ovpn_priv *ovpn)
+{
+	int err;
+
+	err = rhashtable_init(&ovpn->peers->by_id, &ovpn_peer_id_rhash_params);
+	if (err < 0)
+		return err;
+
+	err = rhashtable_init(&ovpn->peers->by_transp_addr,
+			      &ovpn_peer_transp_addr_rhash_params);
+	if (err < 0)
+		goto err_transp;
+
+	err = rhashtable_init(&ovpn->peers->by_vpn_addr,
+			      &ovpn_peer_vpn_addr_rhash_params);
+	if (err < 0)
+		goto err_vpn;
+
+	return err;
+
+err_vpn:
+	rhashtable_destroy(&ovpn->peers->by_transp_addr);
+err_transp:
+	rhashtable_destroy(&ovpn->peers->by_id);
+
+	return err;
+}
+
+/**
+ * ovpn_peers_rhashtables_destroy - destroy rhashtables for peer storage
+ * @ovpn: the openvpn instance to destroy the rhashtables for
+ */
+void ovpn_peers_rhashtables_destroy(struct ovpn_priv *ovpn)
+{
+	if (ovpn->mode != OVPN_MODE_MP)
+		return;
+
+	rhashtable_destroy(&ovpn->peers->by_id);
+	rhashtable_destroy(&ovpn->peers->by_transp_addr);
+	rhashtable_destroy(&ovpn->peers->by_vpn_addr);
+}
 
 /**
  * ovpn_peer_keepalive_set - configure keepalive values for peer
@@ -152,19 +329,6 @@ int ovpn_peer_reset_sockaddr(struct ovpn_peer *peer,
 	return 0;
 }
 
-/* variable name __tbl2 needs to be different from __tbl1
- * in the macro below to avoid confusing clang
- */
-#define ovpn_get_hash_slot(_tbl, _key, _key_len) ({	\
-	typeof(_tbl) *__tbl2 = &(_tbl);			\
-	jhash(_key, _key_len, 0) % HASH_SIZE(*__tbl2);	\
-})
-
-#define ovpn_get_hash_head(_tbl, _key, _key_len) ({		\
-	typeof(_tbl) *__tbl1 = &(_tbl);				\
-	&(*__tbl1)[ovpn_get_hash_slot(*__tbl1, _key, _key_len)];\
-})
-
 /**
  * ovpn_peer_endpoints_update - update remote or local endpoint for peer
  * @peer: peer to update the remote endpoint for
@@ -172,13 +336,14 @@ int ovpn_peer_reset_sockaddr(struct ovpn_peer *peer,
  */
 void ovpn_peer_endpoints_update(struct ovpn_peer *peer, struct sk_buff *skb)
 {
-	struct hlist_nulls_head *nhead;
+	struct ovpn_peer *duplicate;
 	struct sockaddr_storage ss;
 	const u8 *local_ip = NULL;
 	struct sockaddr_in6 *sa6;
 	struct sockaddr_in *sa;
 	struct ovpn_bind *bind;
 	size_t salen = 0;
+	int err;
 
 	spin_lock_bh(&peer->lock);
 	bind = rcu_dereference_protected(peer->bind,
@@ -241,6 +406,21 @@ void ovpn_peer_endpoints_update(struct ovpn_peer *peer, struct sk_buff *skb)
 	if (likely(!salen))
 		goto unlock;
 
+	/* remove the peer from the transport rhashtable */
+	if (peer->ovpn->mode == OVPN_MODE_MP) {
+		err = rhashtable_remove_fast(&peer->ovpn->peers->by_transp_addr,
+			&peer->rhash_entry_transp_addr,
+			peer->bind->remote.in4.sin_family == AF_INET ?
+				ovpn_peer_transp_addr4_rhash_params :
+				ovpn_peer_transp_addr6_rhash_params);
+		if (unlikely(err < 0)) {
+			netdev_warn(peer->ovpn->dev,
+			   "hashtable removal failed during float for peer %u:%d\n",
+			   peer->id, err);
+			goto unlock;
+		}
+	}
+
 	if (unlikely(ovpn_peer_reset_sockaddr(peer,
 					      (struct sockaddr_storage *)&ss,
 					      local_ip) < 0))
@@ -257,15 +437,8 @@ void ovpn_peer_endpoints_update(struct ovpn_peer *peer, struct sk_buff *skb)
 	if (peer->ovpn->mode == OVPN_MODE_MP) {
 		spin_lock_bh(&peer->ovpn->lock);
 		spin_lock_bh(&peer->lock);
-		bind = rcu_dereference_protected(peer->bind,
-						 lockdep_is_held(&peer->lock));
-		if (unlikely(!bind)) {
-			spin_unlock_bh(&peer->lock);
-			spin_unlock_bh(&peer->ovpn->lock);
-			return;
-		}
 
-		/* his function may be invoked concurrently, therefore another
+		/* this function may be invoked concurrently, therefore another
 		 * float may have happened in parallel: perform rehashing
 		 * using the peer->bind->remote directly as key
 		 */
@@ -279,12 +452,30 @@ void ovpn_peer_endpoints_update(struct ovpn_peer *peer, struct sk_buff *skb)
 			break;
 		}
 
-		/* remove old hashing */
-		hlist_nulls_del_init_rcu(&peer->hash_entry_transp_addr);
-		/* re-add with new transport address */
-		nhead = ovpn_get_hash_head(peer->ovpn->peers->by_transp_addr,
-					   &bind->remote, salen);
-		hlist_nulls_add_head_rcu(&peer->hash_entry_transp_addr, nhead);
+		duplicate = ovpn_peer_get_by_transp_addr(peer->ovpn, skb);
+		if (unlikely(duplicate)) {
+			netdev_warn(peer->ovpn->dev,
+			   "peer %u has the same transport address as the floated peer: dropping the floated peer\n",
+			   peer->id);
+			ovpn_peer_del(peer,
+				      OVPN_DEL_PEER_REASON_TRANSPORT_ERROR);
+		}
+
+		err = rhashtable_lookup_insert_key(&peer->ovpn->peers->by_transp_addr,
+									 &peer->bind->remote,
+									 &peer->rhash_entry_transp_addr,
+									 bind->remote.in4.sin_family == AF_INET ?
+									 ovpn_peer_transp_addr4_rhash_params :
+									 ovpn_peer_transp_addr6_rhash_params);
+		/* this should definitely not happen as we just checked for
+		 * duplicates
+		 */
+		if (unlikely(err < 0)) {
+			netdev_err(peer->ovpn->dev,
+				    "cannot insert floated peer %u in the hashtable because it's a duplicate\n",
+				    peer->id);
+		}
+
 		spin_unlock_bh(&peer->lock);
 		spin_unlock_bh(&peer->ovpn->lock);
 	}
@@ -396,6 +587,20 @@ static struct in6_addr ovpn_nexthop_from_skb6(struct sk_buff *skb)
 	return rt->rt6i_gateway;
 }
 
+static inline struct ovpn_peer_vpn_rht_wrapper *
+ovpn_peer_get_vpn_wrapper4(struct ovpn_priv *ovpn, const struct in_addr *addr)
+{
+	return rhashtable_lookup_fast(&ovpn->peers->by_vpn_addr, addr,
+				      ovpn_peer_vpn_addr4_rhash_params);
+}
+
+static inline struct ovpn_peer_vpn_rht_wrapper *
+ovpn_peer_get_vpn_wrapper6(struct ovpn_priv *ovpn, struct in6_addr *addr)
+{
+	return rhashtable_lookup_fast(&ovpn->peers->by_vpn_addr, addr,
+				      ovpn_peer_vpn_addr6_rhash_params);
+}
+
 /**
  * ovpn_peer_get_by_vpn_addr4 - retrieve peer by its VPN IPv4 address
  * @ovpn: the openvpn instance to search
@@ -408,27 +613,10 @@ static struct in6_addr ovpn_nexthop_from_skb6(struct sk_buff *skb)
 static struct ovpn_peer *ovpn_peer_get_by_vpn_addr4(struct ovpn_priv *ovpn,
 						    __be32 addr)
 {
-	struct hlist_nulls_head *nhead;
-	struct hlist_nulls_node *ntmp;
-	struct ovpn_peer *tmp;
-	unsigned int slot;
-
-begin:
-	slot = ovpn_get_hash_slot(ovpn->peers->by_vpn_addr, &addr,
-				  sizeof(addr));
-	nhead = &ovpn->peers->by_vpn_addr[slot];
-
-	hlist_nulls_for_each_entry_rcu(tmp, ntmp, nhead, hash_entry_addr4)
-		if (addr == tmp->vpn_addrs.ipv4.s_addr)
-			return tmp;
-
-	/* item may have moved during lookup - check nulls and restart
-	 * if that's the case
-	 */
-	if (get_nulls_value(ntmp) != slot)
-		goto begin;
-
-	return NULL;
+	const struct in_addr key = { addr };
+	const struct ovpn_peer_vpn_rht_wrapper *wrapper =
+		ovpn_peer_get_vpn_wrapper4(ovpn, &key);
+	return wrapper ? wrapper->peer : NULL;
 }
 
 /**
@@ -443,27 +631,9 @@ begin:
 static struct ovpn_peer *ovpn_peer_get_by_vpn_addr6(struct ovpn_priv *ovpn,
 						    struct in6_addr *addr)
 {
-	struct hlist_nulls_head *nhead;
-	struct hlist_nulls_node *ntmp;
-	struct ovpn_peer *tmp;
-	unsigned int slot;
-
-begin:
-	slot = ovpn_get_hash_slot(ovpn->peers->by_vpn_addr, addr,
-				  sizeof(*addr));
-	nhead = &ovpn->peers->by_vpn_addr[slot];
-
-	hlist_nulls_for_each_entry_rcu(tmp, ntmp, nhead, hash_entry_addr6)
-		if (ipv6_addr_equal(addr, &tmp->vpn_addrs.ipv6))
-			return tmp;
-
-	/* item may have moved during lookup - check nulls and restart
-	 * if that's the case
-	 */
-	if (get_nulls_value(ntmp) != slot)
-		goto begin;
-
-	return NULL;
+	const struct ovpn_peer_vpn_rht_wrapper *wrapper =
+		ovpn_peer_get_vpn_wrapper6(ovpn, addr);
+	return wrapper ? wrapper->peer : NULL;
 }
 
 /**
@@ -543,11 +713,10 @@ ovpn_peer_get_by_transp_addr_p2p(struct ovpn_priv *ovpn,
 struct ovpn_peer *ovpn_peer_get_by_transp_addr(struct ovpn_priv *ovpn,
 					       struct sk_buff *skb)
 {
-	struct ovpn_peer *tmp, *peer = NULL;
 	struct sockaddr_storage ss = { 0 };
-	struct hlist_nulls_head *nhead;
-	struct hlist_nulls_node *ntmp;
-	unsigned int slot;
+	struct sockaddr_in6 *sa6;
+	struct sockaddr_in *sa;
+	struct ovpn_peer *peer = NULL;
 	ssize_t sa_len;
 
 	sa_len = ovpn_peer_skb_to_sockaddr(skb, &ss);
@@ -558,27 +727,22 @@ struct ovpn_peer *ovpn_peer_get_by_transp_addr(struct ovpn_priv *ovpn,
 		return ovpn_peer_get_by_transp_addr_p2p(ovpn, &ss);
 
 	rcu_read_lock();
-begin:
-	slot = ovpn_get_hash_slot(ovpn->peers->by_transp_addr, &ss, sa_len);
-	nhead = &ovpn->peers->by_transp_addr[slot];
-
-	hlist_nulls_for_each_entry_rcu(tmp, ntmp, nhead,
-				       hash_entry_transp_addr) {
-		if (!ovpn_peer_transp_match(tmp, &ss))
-			continue;
-
-		if (!ovpn_peer_hold(tmp))
-			continue;
-
-		peer = tmp;
+	switch (ss.ss_family) {
+	case AF_INET:
+		sa = (struct sockaddr_in *)&ss;
+		peer = rhashtable_lookup_fast(
+			&ovpn->peers->by_transp_addr, &sa->sin_addr,
+			ovpn_peer_transp_addr4_rhash_params);
+		break;
+	case AF_INET6:
+		sa6 = (struct sockaddr_in6 *)&ss;
+		peer = rhashtable_lookup_fast(
+			&ovpn->peers->by_transp_addr, &sa6->sin6_addr,
+			ovpn_peer_transp_addr6_rhash_params);
 		break;
 	}
-
-	/* item may have moved during lookup - check nulls and restart
-	 * if that's the case
-	 */
-	if (!peer && get_nulls_value(ntmp) != slot)
-		goto begin;
+	if (peer && !ovpn_peer_hold(peer))
+		peer = NULL;
 	rcu_read_unlock();
 
 	return peer;
@@ -614,26 +778,16 @@ static struct ovpn_peer *ovpn_peer_get_by_id_p2p(struct ovpn_priv *ovpn,
  */
 struct ovpn_peer *ovpn_peer_get_by_id(struct ovpn_priv *ovpn, u32 peer_id)
 {
-	struct ovpn_peer *tmp, *peer = NULL;
-	struct hlist_head *head;
+	struct ovpn_peer *peer = NULL;
 
 	if (ovpn->mode == OVPN_MODE_P2P)
 		return ovpn_peer_get_by_id_p2p(ovpn, peer_id);
 
-	head = ovpn_get_hash_head(ovpn->peers->by_id, &peer_id,
-				  sizeof(peer_id));
-
 	rcu_read_lock();
-	hlist_for_each_entry_rcu(tmp, head, hash_entry_id) {
-		if (tmp->id != peer_id)
-			continue;
-
-		if (!ovpn_peer_hold(tmp))
-			continue;
-
-		peer = tmp;
-		break;
-	}
+	peer = rhashtable_lookup_fast(&ovpn->peers->by_id, &peer_id,
+				      ovpn_peer_id_rhash_params);
+	if (peer && !ovpn_peer_hold(peer))
+		peer = NULL;
 	rcu_read_unlock();
 
 	return peer;
@@ -657,14 +811,41 @@ static void ovpn_peer_remove_work(struct work_struct *work)
 static void ovpn_peer_remove(struct ovpn_peer *peer,
 			     enum ovpn_del_peer_reason reason)
 {
+	struct ovpn_peer_vpn_rht_wrapper *wrapper;
+
 	lockdep_assert_held(&peer->ovpn->lock);
 
 	switch (peer->ovpn->mode) {
 	case OVPN_MODE_MP:
-		hlist_del_init_rcu(&peer->hash_entry_id);
-		hlist_nulls_del_init_rcu(&peer->hash_entry_addr4);
-		hlist_nulls_del_init_rcu(&peer->hash_entry_addr6);
-		hlist_nulls_del_init_rcu(&peer->hash_entry_transp_addr);
+		if (peer->bind) {
+			rhashtable_remove_fast(&peer->ovpn->peers->by_transp_addr,
+				&peer->rhash_entry_transp_addr,
+				peer->bind->remote.in4.sin_family == AF_INET ?
+					ovpn_peer_transp_addr4_rhash_params :
+					ovpn_peer_transp_addr6_rhash_params);
+		}
+
+		rhashtable_remove_fast(&peer->ovpn->peers->by_id,
+				       &peer->rhash_entry_id,
+				       ovpn_peer_id_rhash_params);
+
+		wrapper = ovpn_peer_get_vpn_wrapper4(peer->ovpn,
+						     &peer->vpn_addrs.ipv4);
+		if (wrapper) {
+			rhashtable_remove_fast(&peer->ovpn->peers->by_vpn_addr,
+					       &wrapper->rhash_entry,
+					       ovpn_peer_vpn_addr_rhash_params);
+			kfree(wrapper);
+		}
+
+		wrapper = ovpn_peer_get_vpn_wrapper6(peer->ovpn,
+						     &peer->vpn_addrs.ipv6);
+		if (wrapper) {
+			rhashtable_remove_fast(&peer->ovpn->peers->by_vpn_addr,
+					       &wrapper->rhash_entry,
+					       ovpn_peer_vpn_addr_rhash_params);
+			kfree(wrapper);
+		}
 		break;
 	case OVPN_MODE_P2P:
 		RCU_INIT_POINTER(peer->ovpn->peer, NULL);
@@ -825,8 +1006,8 @@ out:
 bool ovpn_peer_check_by_src(struct ovpn_priv *ovpn, struct sk_buff *skb,
 			    struct ovpn_peer *peer)
 {
-	bool match = false;
 	struct in6_addr addr6;
+	bool match = false;
 	__be32 addr4;
 
 	if (ovpn->mode == OVPN_MODE_P2P) {
@@ -860,35 +1041,44 @@ bool ovpn_peer_check_by_src(struct ovpn_priv *ovpn, struct sk_buff *skb,
 	return match;
 }
 
-void ovpn_peer_hash_vpn_ip(struct ovpn_peer *peer)
+int ovpn_peer_hash_vpn_ip(struct ovpn_peer *peer)
 {
-	struct hlist_nulls_head *nhead;
+	struct ovpn_peer_vpn_rht_wrapper *wrapper4, *wrapper6;
+	int err = 0;
 
 	lockdep_assert_held(&peer->ovpn->lock);
 
 	/* rehashing makes sense only in multipeer mode */
 	if (peer->ovpn->mode != OVPN_MODE_MP)
-		return;
+		return 0;
 
 	if (peer->vpn_addrs.ipv4.s_addr != htonl(INADDR_ANY)) {
-		/* remove potential old hashing */
-		hlist_nulls_del_init_rcu(&peer->hash_entry_addr4);
+		wrapper4 = kzalloc(sizeof(*wrapper4), GFP_ATOMIC);
+		if (!wrapper4)
+			return -ENOMEM;
 
-		nhead = ovpn_get_hash_head(peer->ovpn->peers->by_vpn_addr,
-					   &peer->vpn_addrs.ipv4,
-					   sizeof(peer->vpn_addrs.ipv4));
-		hlist_nulls_add_head_rcu(&peer->hash_entry_addr4, nhead);
+		wrapper4->peer = peer;
+		err = rhashtable_lookup_insert_key(&peer->ovpn->peers->by_vpn_addr,
+								 &peer->vpn_addrs.ipv4,
+								 &wrapper4->rhash_entry,
+								 ovpn_peer_vpn_addr4_rhash_params);
+		return err;
 	}
 
 	if (!ipv6_addr_any(&peer->vpn_addrs.ipv6)) {
-		/* remove potential old hashing */
-		hlist_nulls_del_init_rcu(&peer->hash_entry_addr6);
+		wrapper6 = kzalloc(sizeof(*wrapper6), GFP_ATOMIC);
+		if (!wrapper6)
+			return -ENOMEM;
 
-		nhead = ovpn_get_hash_head(peer->ovpn->peers->by_vpn_addr,
-					   &peer->vpn_addrs.ipv6,
-					   sizeof(peer->vpn_addrs.ipv6));
-		hlist_nulls_add_head_rcu(&peer->hash_entry_addr6, nhead);
+		wrapper6->peer = peer;
+		err = rhashtable_lookup_insert_key(&peer->ovpn->peers->by_vpn_addr,
+								 &peer->vpn_addrs.ipv6,
+								 &wrapper6->rhash_entry,
+								 ovpn_peer_vpn_addr6_rhash_params);
+		return err;
 	}
+
+	return -EINVAL;
 }
 
 /**
@@ -900,13 +1090,8 @@ void ovpn_peer_hash_vpn_ip(struct ovpn_peer *peer)
  */
 static int ovpn_peer_add_mp(struct ovpn_priv *ovpn, struct ovpn_peer *peer)
 {
-	struct sockaddr_storage sa = { 0 };
-	struct hlist_nulls_head *nhead;
-	struct sockaddr_in6 *sa6;
-	struct sockaddr_in *sa4;
 	struct ovpn_bind *bind;
 	struct ovpn_peer *tmp;
-	size_t salen;
 	int ret = 0;
 
 	spin_lock_bh(&ovpn->lock);
@@ -921,38 +1106,32 @@ static int ovpn_peer_add_mp(struct ovpn_priv *ovpn, struct ovpn_peer *peer)
 	bind = rcu_dereference_protected(peer->bind, true);
 	/* peers connected via TCP have bind == NULL */
 	if (bind) {
-		switch (bind->remote.in4.sin_family) {
-		case AF_INET:
-			sa4 = (struct sockaddr_in *)&sa;
-
-			sa4->sin_family = AF_INET;
-			sa4->sin_addr.s_addr = bind->remote.in4.sin_addr.s_addr;
-			sa4->sin_port = bind->remote.in4.sin_port;
-			salen = sizeof(*sa4);
-			break;
-		case AF_INET6:
-			sa6 = (struct sockaddr_in6 *)&sa;
-
-			sa6->sin6_family = AF_INET6;
-			sa6->sin6_addr = bind->remote.in6.sin6_addr;
-			sa6->sin6_port = bind->remote.in6.sin6_port;
-			salen = sizeof(*sa6);
-			break;
-		default:
+		if (bind->remote.in4.sin_family != AF_INET &&
+		    bind->remote.in4.sin_family != AF_INET6) {
 			ret = -EPROTONOSUPPORT;
 			goto out;
 		}
 
-		nhead = ovpn_get_hash_head(ovpn->peers->by_transp_addr, &sa,
-					   salen);
-		hlist_nulls_add_head_rcu(&peer->hash_entry_transp_addr, nhead);
+		ret = rhashtable_lookup_insert_key(&ovpn->peers->by_transp_addr,
+							   &peer->bind->remote,
+							   &peer->rhash_entry_transp_addr,
+							   bind->remote.in4.sin_family == AF_INET ?
+								   ovpn_peer_transp_addr4_rhash_params :
+								   ovpn_peer_transp_addr6_rhash_params);
+		if (ret)
+			goto out;
 	}
 
-	hlist_add_head_rcu(&peer->hash_entry_id,
-			   ovpn_get_hash_head(ovpn->peers->by_id, &peer->id,
-					      sizeof(peer->id)));
+	ret = rhashtable_insert_fast(&ovpn->peers->by_id,
+							  &peer->rhash_entry_id,
+							  ovpn_peer_id_rhash_params);
+	if (ret)
+		goto out;
 
-	ovpn_peer_hash_vpn_ip(peer);
+	ret = ovpn_peer_hash_vpn_ip(peer);
+	if (ret)
+		goto out;
+
 out:
 	spin_unlock_bh(&ovpn->lock);
 	return ret;
@@ -1110,13 +1289,24 @@ int ovpn_peer_del(struct ovpn_peer *peer, enum ovpn_del_peer_reason reason)
 void ovpn_peers_free(struct ovpn_priv *ovpn,
 		     enum ovpn_del_peer_reason reason)
 {
-	struct hlist_node *tmp;
+	struct rhashtable_iter iter;
 	struct ovpn_peer *peer;
-	int bkt;
 
 	spin_lock_bh(&ovpn->lock);
-	hash_for_each_safe(ovpn->peers->by_id, bkt, tmp, peer, hash_entry_id)
+
+	rhashtable_walk_enter(&ovpn->peers->by_id, &iter);
+	rhashtable_walk_start(&iter);
+	while ((peer = rhashtable_walk_next(&iter))) {
+		/* -EAGAIN signals a resize event - iter is rewound back and we continue
+		 * the walk
+		 */
+		if (IS_ERR(peer))
+			continue;
 		ovpn_peer_remove(peer, reason);
+	}
+	rhashtable_walk_stop(&iter);
+	rhashtable_walk_exit(&iter);
+
 	spin_unlock_bh(&ovpn->lock);
 }
 
@@ -1192,13 +1382,19 @@ static time64_t ovpn_peer_keepalive_work_mp(struct ovpn_priv *ovpn,
 					    time64_t now)
 {
 	time64_t tmp_next_run, next_run = 0;
-	struct hlist_node *tmp;
+	struct rhashtable_iter iter;
 	struct ovpn_peer *peer;
-	int bkt;
 
 	lockdep_assert_held(&ovpn->lock);
 
-	hash_for_each_safe(ovpn->peers->by_id, bkt, tmp, peer, hash_entry_id) {
+	rhashtable_walk_enter(&ovpn->peers->by_id, &iter);
+	rhashtable_walk_start(&iter);
+	while ((peer = rhashtable_walk_next(&iter))) {
+		/* -EAGAIN signals a resize event - iter is rewound back and we continue
+		 * the walk
+		 */
+		if (IS_ERR(peer))
+			continue;
 		tmp_next_run = ovpn_peer_keepalive_work_single(peer, now);
 		if (!tmp_next_run)
 			continue;
@@ -1209,6 +1405,8 @@ static time64_t ovpn_peer_keepalive_work_mp(struct ovpn_priv *ovpn,
 		if (!next_run || tmp_next_run < next_run)
 			next_run = tmp_next_run;
 	}
+	rhashtable_walk_stop(&iter);
+	rhashtable_walk_exit(&iter);
 
 	return next_run;
 }

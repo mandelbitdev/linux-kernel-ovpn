@@ -10,6 +10,7 @@
 #ifndef _NET_OVPN_OVPNSTRUCT_H_
 #define _NET_OVPN_OVPNSTRUCT_H_
 
+#include <linux/rhashtable.h>
 #include <linux/workqueue.h>
 #include <net/gro_cells.h>
 #include <uapi/linux/if_link.h>
@@ -24,9 +25,9 @@
  *		    rehashed on the fly due to peer IP change)
  */
 struct ovpn_peer_collection {
-	DECLARE_HASHTABLE(by_id, 12);
-	struct hlist_nulls_head by_vpn_addr[1 << 12];
-	struct hlist_nulls_head by_transp_addr[1 << 12];
+	struct rhashtable by_id;
+	struct rhashtable by_vpn_addr;
+	struct rhashtable by_transp_addr;
 };
 
 /**

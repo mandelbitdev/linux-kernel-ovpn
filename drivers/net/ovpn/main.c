@@ -29,6 +29,8 @@ static void ovpn_priv_free(struct net_device *net)
 {
 	struct ovpn_priv *ovpn = netdev_priv(net);
 
+	ovpn_peers_rhashtables_destroy(ovpn);
+
 	kfree(ovpn->peers);
 }
 
@@ -147,7 +149,7 @@ static void ovpn_setup(struct net_device *dev)
 static int ovpn_mp_alloc(struct ovpn_priv *ovpn)
 {
 	struct in_device *dev_v4;
-	int i;
+	int err;
 
 	if (ovpn->mode != OVPN_MODE_MP)
 		return 0;
@@ -172,13 +174,12 @@ static int ovpn_mp_alloc(struct ovpn_priv *ovpn)
 	if (!ovpn->peers)
 		return -ENOMEM;
 
-	for (i = 0; i < ARRAY_SIZE(ovpn->peers->by_id); i++) {
-		INIT_HLIST_HEAD(&ovpn->peers->by_id[i]);
-		INIT_HLIST_NULLS_HEAD(&ovpn->peers->by_vpn_addr[i], i);
-		INIT_HLIST_NULLS_HEAD(&ovpn->peers->by_transp_addr[i], i);
-	}
+	err = ovpn_peers_rhashtables_init(ovpn);
+	if (err < 0)
+		netdev_err(ovpn->dev,
+			   "ovpn: cannot initialize rhashtables for peers\n");
 
-	return 0;
+	return err;
 }
 
 static int ovpn_newlink(struct net *src_net, struct net_device *dev,

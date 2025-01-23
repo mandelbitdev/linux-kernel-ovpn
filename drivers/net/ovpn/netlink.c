@@ -480,11 +480,12 @@ int ovpn_nl_peer_set_doit(struct sk_buff *skb, struct genl_info *info)
 	 * is required
 	 */
 	if (ret > 0)
-		ovpn_peer_hash_vpn_ip(peer);
+		ret = ovpn_peer_hash_vpn_ip(peer);
+
 	spin_unlock_bh(&ovpn->lock);
 	ovpn_peer_put(peer);
 
-	return 0;
+	return ret;
 }
 
 static int ovpn_nl_send_peer(struct sk_buff *skb, const struct genl_info *info,
@@ -643,7 +644,8 @@ err:
 int ovpn_nl_peer_get_dumpit(struct sk_buff *skb, struct netlink_callback *cb)
 {
 	const struct genl_info *info = genl_info_dump(cb);
-	int bkt, last_idx = cb->args[1], dumped = 0;
+	int last_idx = cb->args[1], dumped = 0;
+	struct rhashtable_iter iter;
 	netdevice_tracker tracker;
 	struct ovpn_priv *ovpn;
 	struct ovpn_peer *peer;
@@ -668,9 +670,15 @@ int ovpn_nl_peer_get_dumpit(struct sk_buff *skb, struct netlink_callback *cb)
 		}
 		rcu_read_unlock();
 	} else {
-		rcu_read_lock();
-		hash_for_each_rcu(ovpn->peers->by_id, bkt, peer,
-				  hash_entry_id) {
+		rhashtable_walk_enter(&ovpn->peers->by_id, &iter);
+		rhashtable_walk_start(&iter);
+		while ((peer = rhashtable_walk_next(&iter))) {
+			/* -EAGAIN signals a resize event - iter is rewound back and we
+			 * continue the walk
+			 */
+			if (IS_ERR(peer))
+				continue;
+
 			/* skip already dumped peers that were dumped by
 			 * previous invocations
 			 */
@@ -688,7 +696,8 @@ int ovpn_nl_peer_get_dumpit(struct sk_buff *skb, struct netlink_callback *cb)
 			/* count peers being dumped during this invocation */
 			dumped++;
 		}
-		rcu_read_unlock();
+		rhashtable_walk_stop(&iter);
+		rhashtable_walk_exit(&iter);
 	}
 
 out:
